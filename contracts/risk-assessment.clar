@@ -1,5 +1,5 @@
 ;; BTC Shield - Risk Assessment Smart Contract
-;; Enhanced with risk models and specialized areas
+;; This contract handles risk assessment and verification for the insurance protocol
 
 ;; Data Maps
 (define-map risk-oracles

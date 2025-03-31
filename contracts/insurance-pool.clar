@@ -1,5 +1,5 @@
 ;; BTC Shield - Insurance Pool Smart Contract
-;; Insurance pool with policy creation and basic claims
+;; Enhanced with coverage types and dynamic premiums
 
 ;; Data Variables
 (define-data-var pool-balance uint u0)
@@ -8,7 +8,7 @@
 (define-data-var minimum-coverage uint u10000000) ;; 0.1 STX minimum
 
 ;; Data Maps
-(define-map insurers principal { staked-amount: uint, rewards-accumulated: uint })
+(define-map insurers principal { staked-amount: uint, rewards-accumulated: uint, last-update: uint })
 (define-map policies 
   { policy-id: uint } 
   { 
@@ -17,8 +17,16 @@
     premium-amount: uint, 
     start-block: uint, 
     end-block: uint, 
+    coverage-type: (string-ascii 20),
     is-active: bool,
     is-claimed: bool
+  }
+)
+(define-map coverage-types 
+  { type-id: (string-ascii 20) } 
+  { 
+    base-premium: uint, 
+    risk-factor: uint
   }
 )
 (define-map claims 
@@ -51,11 +59,13 @@
 (define-public (stake-insurance (amount uint))
   (let (
     (current-stake (default-to u0 (get staked-amount (map-get? insurers tx-sender))))
+    (current-block block-height)
   )
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     (map-set insurers tx-sender {
       staked-amount: (+ current-stake amount),
-      rewards-accumulated: (default-to u0 (get rewards-accumulated (map-get? insurers tx-sender)))
+      rewards-accumulated: (default-to u0 (get rewards-accumulated (map-get? insurers tx-sender))),
+      last-update: current-block
     })
     (var-set total-staked (+ (var-get total-staked) amount))
     (var-set pool-balance (+ (var-get pool-balance) amount))
@@ -63,16 +73,25 @@
   )
 )
 
-;; Calculate premium (simple fixed percentage)
-(define-read-only (calculate-premium (coverage-amount uint))
-  ;; 2% premium rate
-  (/ (* coverage-amount u2) u100)
+;; Calculate premium based on coverage amount, base rate, and risk factor
+(define-read-only (calculate-premium (coverage-amount uint) (base-premium uint) (risk-factor uint))
+  (let (
+    ;; Formula: (coverage * base-premium * risk-factor) / 10000
+    ;; Base premium and risk factor are in basis points (100 = 1%)
+    (premium (/ (* (* coverage-amount base-premium) risk-factor) u1000000))
+  )
+    ;; Ensure the premium is at least 1 microSTX
+    (if (> premium u0) premium u1)
+  )
 )
 
 ;; Request policy coverage
-(define-public (purchase-policy (coverage-amount uint) (duration uint))
+(define-public (purchase-policy (coverage-amount uint) (coverage-type (string-ascii 20)) (duration uint))
   (let (
-    (premium-amount (calculate-premium coverage-amount))
+    (coverage-details (unwrap! (map-get? coverage-types {type-id: coverage-type}) err-not-found))
+    (base-premium (get base-premium coverage-details))
+    (risk-factor (get risk-factor coverage-details))
+    (premium-amount (calculate-premium coverage-amount base-premium risk-factor))
     (policy-id (var-get next-policy-id))
     (current-block block-height)
     (expiration-block (+ current-block duration))
@@ -97,6 +116,7 @@
         premium-amount: premium-amount,
         start-block: current-block,
         end-block: expiration-block,
+        coverage-type: coverage-type,
         is-active: true,
         is-claimed: false
       }
@@ -186,6 +206,21 @@
   )
 )
 
+;; Register a coverage type (admin only)
+(define-public (register-coverage-type (type-id (string-ascii 20)) (base-premium uint) (risk-factor uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (map-set coverage-types 
+      {type-id: type-id} 
+      {
+        base-premium: base-premium,
+        risk-factor: risk-factor
+      }
+    )
+    (ok type-id)
+  )
+)
+
 ;; Get insurer data
 (define-read-only (get-insurer-data (address principal))
   (map-get? insurers address)
@@ -199,6 +234,11 @@
 ;; Get claim information
 (define-read-only (get-claim (claim-id uint))
   (map-get? claims {claim-id: claim-id})
+)
+
+;; Get coverage type information
+(define-read-only (get-coverage-type (type-id (string-ascii 20)))
+  (map-get? coverage-types {type-id: type-id})
 )
 
 ;; Get pool stats

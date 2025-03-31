@@ -1,5 +1,5 @@
 ;; BTC Shield - Insurance Pool Smart Contract
-;; Insurance pool with policy creation functionality
+;; Insurance pool with policy creation and basic claims
 
 ;; Data Variables
 (define-data-var pool-balance uint u0)
@@ -17,7 +17,17 @@
     premium-amount: uint, 
     start-block: uint, 
     end-block: uint, 
-    is-active: bool
+    is-active: bool,
+    is-claimed: bool
+  }
+)
+(define-map claims 
+  { claim-id: uint } 
+  { 
+    policy-id: uint, 
+    amount: uint, 
+    status: (string-ascii 10),
+    verdict: bool
   }
 )
 
@@ -25,10 +35,15 @@
 (define-constant contract-owner tx-sender)
 (define-constant err-unauthorized (err u401))
 (define-constant err-insufficient-funds (err u402))
+(define-constant err-policy-expired (err u403))
+(define-constant err-not-found (err u404))
+(define-constant err-invalid-policy (err u405))
+(define-constant err-already-claimed (err u406))
 (define-constant err-insufficient-coverage (err u407))
 
-;; Policy ID counter
+;; ID counters
 (define-data-var next-policy-id uint u1)
+(define-data-var next-claim-id uint u1)
 
 ;; Functions
 
@@ -82,7 +97,8 @@
         premium-amount: premium-amount,
         start-block: current-block,
         end-block: expiration-block,
-        is-active: true
+        is-active: true,
+        is-claimed: false
       }
     )
     
@@ -90,6 +106,83 @@
     (var-set next-policy-id (+ policy-id u1))
     
     (ok policy-id)
+  )
+)
+
+;; Submit a claim
+(define-public (submit-claim (policy-id uint) (amount uint))
+  (let (
+    (policy (unwrap! (map-get? policies {policy-id: policy-id}) err-not-found))
+    (claim-id (var-get next-claim-id))
+    (current-block block-height)
+  )
+    ;; Verify policy ownership
+    (asserts! (is-eq (get owner policy) tx-sender) err-unauthorized)
+    ;; Verify policy is active
+    (asserts! (get is-active policy) err-invalid-policy)
+    ;; Verify policy has not expired
+    (asserts! (<= current-block (get end-block policy)) err-policy-expired)
+    ;; Verify policy has not been claimed
+    (asserts! (not (get is-claimed policy)) err-already-claimed)
+    ;; Verify claim amount is within coverage
+    (asserts! (<= amount (get coverage-amount policy)) err-insufficient-funds)
+    
+    ;; Create the claim
+    (map-set claims 
+      {claim-id: claim-id} 
+      {
+        policy-id: policy-id,
+        amount: amount,
+        status: "pending",
+        verdict: false
+      }
+    )
+    
+    ;; Increment claim ID
+    (var-set next-claim-id (+ claim-id u1))
+    
+    (ok claim-id)
+  )
+)
+
+;; Approve a claim (admin only)
+(define-public (approve-claim (claim-id uint))
+  (let (
+    (claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-found))
+    (policy-id (get policy-id claim))
+    (policy (unwrap! (map-get? policies {policy-id: policy-id}) err-not-found))
+    (payout-amount (get amount claim))
+  )
+    ;; Verify caller is admin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    
+    ;; Ensure we have funds to cover the claim
+    (asserts! (<= payout-amount (var-get pool-balance)) err-insufficient-funds)
+    
+    ;; Update claim status
+    (map-set claims
+      {claim-id: claim-id}
+      (merge claim {
+        status: "approved",
+        verdict: true
+      })
+    )
+    
+    ;; Mark policy as claimed
+    (map-set policies
+      {policy-id: policy-id}
+      (merge policy {
+        is-claimed: true
+      })
+    )
+    
+    ;; Transfer funds to policy owner
+    (try! (as-contract (stx-transfer? payout-amount tx-sender (get owner policy))))
+    
+    ;; Update pool balance
+    (var-set pool-balance (- (var-get pool-balance) payout-amount))
+    
+    (ok claim-id)
   )
 )
 
@@ -101,6 +194,11 @@
 ;; Get policy information
 (define-read-only (get-policy (policy-id uint))
   (map-get? policies {policy-id: policy-id})
+)
+
+;; Get claim information
+(define-read-only (get-claim (claim-id uint))
+  (map-get? claims {claim-id: claim-id})
 )
 
 ;; Get pool stats

@@ -1,5 +1,5 @@
 ;; BTC Shield - Insurance Pool Smart Contract
-;; Enhanced with verification system and evidence tracking
+;; This contract manages the insurance pool, premium collection, and coverage
 
 ;; Data Variables
 (define-data-var pool-balance uint u0)
@@ -77,18 +77,6 @@
   )
 )
 
-;; Calculate premium based on coverage amount, base rate, and risk factor
-(define-read-only (calculate-premium (coverage-amount uint) (base-premium uint) (risk-factor uint))
-  (let (
-    ;; Formula: (coverage * base-premium * risk-factor) / 10000
-    ;; Base premium and risk factor are in basis points (100 = 1%)
-    (premium (/ (* (* coverage-amount base-premium) risk-factor) u1000000))
-  )
-    ;; Ensure the premium is at least 1 microSTX
-    (if (> premium u0) premium u1)
-  )
-)
-
 ;; Request policy coverage
 (define-public (purchase-policy (coverage-amount uint) (coverage-type (string-ascii 20)) (duration uint))
   (let (
@@ -130,6 +118,18 @@
     (var-set next-policy-id (+ policy-id u1))
     
     (ok policy-id)
+  )
+)
+
+;; Calculate premium based on coverage amount, base rate, and risk factor
+(define-read-only (calculate-premium (coverage-amount uint) (base-premium uint) (risk-factor uint))
+  (let (
+    ;; Formula: (coverage * base-premium * risk-factor) / 10000
+    ;; Base premium and risk factor are in basis points (100 = 1%)
+    (premium (/ (* (* coverage-amount base-premium) risk-factor) u1000000))
+  )
+    ;; Ensure the premium is at least 1 microSTX
+    (if (> premium u0) premium u1)
   )
 )
 
@@ -228,22 +228,6 @@
   )
 )
 
-;; Register a coverage type (admin only)
-(define-public (register-coverage-type (type-id (string-ascii 20)) (base-premium uint) (risk-factor uint) (verifier principal))
-  (begin
-    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
-    (map-set coverage-types 
-      {type-id: type-id} 
-      {
-        base-premium: base-premium,
-        risk-factor: risk-factor,
-        claim-verification: verifier
-      }
-    )
-    (ok type-id)
-  )
-)
-
 ;; Unstake funds (for insurers)
 (define-public (unstake (amount uint))
   (let (
@@ -282,6 +266,22 @@
     (total-coverage-liability (* (var-get total-staked) u1)) ;; Placeholder
   )
     (/ (* total-coverage-liability (var-get coverage-ratio)) u100)
+  )
+)
+
+;; Register a coverage type (admin only)
+(define-public (register-coverage-type (type-id (string-ascii 20)) (base-premium uint) (risk-factor uint) (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (map-set coverage-types 
+      {type-id: type-id} 
+      {
+        base-premium: base-premium,
+        risk-factor: risk-factor,
+        claim-verification: verifier
+      }
+    )
+    (ok type-id)
   )
 )
 

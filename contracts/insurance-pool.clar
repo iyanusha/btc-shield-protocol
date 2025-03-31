@@ -1,10 +1,11 @@
 ;; BTC Shield - Insurance Pool Smart Contract
-;; Enhanced with coverage types and dynamic premiums
+;; Enhanced with verification system and evidence tracking
 
 ;; Data Variables
 (define-data-var pool-balance uint u0)
 (define-data-var total-staked uint u0)
 (define-data-var coverage-ratio uint u400) ;; 4x coverage ratio (400%)
+(define-data-var protocol-fee uint u50) ;; 0.5% fee (in basis points)
 (define-data-var minimum-coverage uint u10000000) ;; 0.1 STX minimum
 
 ;; Data Maps
@@ -26,7 +27,8 @@
   { type-id: (string-ascii 20) } 
   { 
     base-premium: uint, 
-    risk-factor: uint
+    risk-factor: uint,
+    claim-verification: principal
   }
 )
 (define-map claims 
@@ -34,22 +36,24 @@
   { 
     policy-id: uint, 
     amount: uint, 
+    evidence: (string-ascii 128),
     status: (string-ascii 10),
+    verifier: principal,
     verdict: bool
   }
 )
 
 ;; Constants
 (define-constant contract-owner tx-sender)
+(define-constant err-not-found (err u404))
 (define-constant err-unauthorized (err u401))
 (define-constant err-insufficient-funds (err u402))
 (define-constant err-policy-expired (err u403))
-(define-constant err-not-found (err u404))
 (define-constant err-invalid-policy (err u405))
 (define-constant err-already-claimed (err u406))
 (define-constant err-insufficient-coverage (err u407))
 
-;; ID counters
+;; Policy ID counter
 (define-data-var next-policy-id uint u1)
 (define-data-var next-claim-id uint u1)
 
@@ -130,11 +134,13 @@
 )
 
 ;; Submit a claim
-(define-public (submit-claim (policy-id uint) (amount uint))
+(define-public (submit-claim (policy-id uint) (amount uint) (evidence (string-ascii 128)))
   (let (
     (policy (unwrap! (map-get? policies {policy-id: policy-id}) err-not-found))
     (claim-id (var-get next-claim-id))
     (current-block block-height)
+    (coverage-details (unwrap! (map-get? coverage-types {type-id: (get coverage-type policy)}) err-not-found))
+    (verifier (get claim-verification coverage-details))
   )
     ;; Verify policy ownership
     (asserts! (is-eq (get owner policy) tx-sender) err-unauthorized)
@@ -153,7 +159,9 @@
       {
         policy-id: policy-id,
         amount: amount,
+        evidence: evidence,
         status: "pending",
+        verifier: verifier,
         verdict: false
       }
     )
@@ -165,36 +173,50 @@
   )
 )
 
-;; Approve a claim (admin only)
-(define-public (approve-claim (claim-id uint))
+;; Verify a claim (called by authorized verifier)
+(define-public (verify-claim (claim-id uint) (approved bool))
   (let (
     (claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-found))
     (policy-id (get policy-id claim))
     (policy (unwrap! (map-get? policies {policy-id: policy-id}) err-not-found))
+    (coverage-details (unwrap! (map-get? coverage-types {type-id: (get coverage-type policy)}) err-not-found))
+  )
+    ;; Verify caller is authorized verifier
+    (asserts! (is-eq tx-sender (get verifier claim)) err-unauthorized)
+    
+    ;; Update claim with verification result
+    (map-set claims 
+      {claim-id: claim-id} 
+      (merge claim {
+        status: (if approved "approved" "rejected"),
+        verdict: approved
+      })
+    )
+    
+    ;; If approved, mark policy as claimed and process payout
+    (if approved
+      (begin
+        (map-set policies 
+          {policy-id: policy-id} 
+          (merge policy {is-claimed: true})
+        )
+        (try! (process-claim-payout claim-id))
+        (ok claim-id)
+      )
+      (ok claim-id)
+    )
+  )
+)
+
+;; Process claim payout (internal function)
+(define-private (process-claim-payout (claim-id uint))
+  (let (
+    (claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-found))
+    (policy (unwrap! (map-get? policies {policy-id: (get policy-id claim)}) err-not-found))
     (payout-amount (get amount claim))
   )
-    ;; Verify caller is admin
-    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
-    
     ;; Ensure we have funds to cover the claim
     (asserts! (<= payout-amount (var-get pool-balance)) err-insufficient-funds)
-    
-    ;; Update claim status
-    (map-set claims
-      {claim-id: claim-id}
-      (merge claim {
-        status: "approved",
-        verdict: true
-      })
-    )
-    
-    ;; Mark policy as claimed
-    (map-set policies
-      {policy-id: policy-id}
-      (merge policy {
-        is-claimed: true
-      })
-    )
     
     ;; Transfer funds to policy owner
     (try! (as-contract (stx-transfer? payout-amount tx-sender (get owner policy))))
@@ -207,45 +229,85 @@
 )
 
 ;; Register a coverage type (admin only)
-(define-public (register-coverage-type (type-id (string-ascii 20)) (base-premium uint) (risk-factor uint))
+(define-public (register-coverage-type (type-id (string-ascii 20)) (base-premium uint) (risk-factor uint) (verifier principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
     (map-set coverage-types 
       {type-id: type-id} 
       {
         base-premium: base-premium,
-        risk-factor: risk-factor
+        risk-factor: risk-factor,
+        claim-verification: verifier
       }
     )
     (ok type-id)
   )
 )
 
-;; Get insurer data
-(define-read-only (get-insurer-data (address principal))
-  (map-get? insurers address)
+;; Unstake funds (for insurers)
+(define-public (unstake (amount uint))
+  (let (
+    (insurer-data (unwrap! (map-get? insurers tx-sender) err-not-found))
+    (staked-amount (get staked-amount insurer-data))
+  )
+    ;; Verify unstake amount
+    (asserts! (<= amount staked-amount) err-insufficient-funds)
+    
+    ;; Verify we maintain coverage ratio after unstake
+    (asserts! (>= (- (var-get total-staked) amount) (get-required-stake)) err-insufficient-coverage)
+    
+    ;; Transfer funds to insurer
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    ;; Update insurer data
+    (map-set insurers tx-sender
+      (merge insurer-data {
+        staked-amount: (- staked-amount amount)
+      })
+    )
+    
+    ;; Update total staked and pool balance
+    (var-set total-staked (- (var-get total-staked) amount))
+    (var-set pool-balance (- (var-get pool-balance) amount))
+    
+    (ok amount)
+  )
 )
 
-;; Get policy information
+;; Calculate required stake based on active policies
+(define-read-only (get-required-stake)
+  (let (
+    ;; In a real implementation, we would iterate through all active policies
+    ;; For simplicity, we're using a static formula here
+    (total-coverage-liability (* (var-get total-staked) u1)) ;; Placeholder
+  )
+    (/ (* total-coverage-liability (var-get coverage-ratio)) u100)
+  )
+)
+
+;; Read-only functions to get information
+
 (define-read-only (get-policy (policy-id uint))
   (map-get? policies {policy-id: policy-id})
 )
 
-;; Get claim information
 (define-read-only (get-claim (claim-id uint))
   (map-get? claims {claim-id: claim-id})
 )
 
-;; Get coverage type information
 (define-read-only (get-coverage-type (type-id (string-ascii 20)))
   (map-get? coverage-types {type-id: type-id})
 )
 
-;; Get pool stats
+(define-read-only (get-insurer-data (address principal))
+  (map-get? insurers address)
+)
+
 (define-read-only (get-pool-stats)
   {
     pool-balance: (var-get pool-balance),
     total-staked: (var-get total-staked),
-    coverage-ratio: (var-get coverage-ratio)
+    coverage-ratio: (var-get coverage-ratio),
+    required-stake: (get-required-stake)
   }
 )
